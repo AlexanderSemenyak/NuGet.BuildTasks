@@ -23,7 +23,6 @@ namespace Microsoft.NuGet.Build.Tasks
         internal const string NuGetPackageVersionMetadata = "NuGetPackageVersion";
         internal const string NuGetIsFrameworkReference = "NuGetIsFrameworkReference";
         internal const string NuGetSourceType = "NuGetSourceType";
-        internal const string NuGetSourceType_Project = "Project";
         internal const string NuGetSourceType_Package = "Package";
 
         internal const string ReferenceImplementationMetadata = "Implementation";
@@ -45,8 +44,6 @@ namespace Microsoft.NuGet.Build.Tasks
         private readonly List<ITaskItem> _fileWrites = new List<ITaskItem>();
 
         private readonly List<string> _packageFolders = new List<string>();
-
-        private readonly Dictionary<string, string> _projectReferencesToOutputBasePaths = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
 
         #region UnitTestSupport
         private readonly FileExists _fileExists = new FileExists(File.Exists);
@@ -143,15 +140,6 @@ namespace Microsoft.NuGet.Build.Tasks
         }
 
         /// <summary>
-        /// A list of project references that are creating packages as listed in the lock file. The OutputPath metadata should
-        /// set on each of these items, which is used by the task to construct full output paths to assets.
-        /// </summary>
-        public ITaskItem[] ProjectReferencesCreatingPackages
-        {
-            get; set;
-        }
-
-        /// <summary>
         /// The base output directory where the temporary, preprocessed files should be written to.
         /// </summary>
         public string ContentPreprocessorOutputDirectory
@@ -238,7 +226,6 @@ namespace Microsoft.NuGet.Build.Tasks
 
             PopulatePackageFolders(lockFile);
 
-            PopulateProjectReferenceMaps();
             GetReferences(lockFile);
             GetCopyLocalItems(lockFile);
             GetAnalyzers(lockFile);
@@ -277,23 +264,6 @@ namespace Microsoft.NuGet.Build.Tasks
                 else
                 {
                     _packageFolders.Add(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".nuget", "packages"));
-                }
-            }
-        }
-
-        private void PopulateProjectReferenceMaps()
-        {
-            foreach (var projectReference in ProjectReferencesCreatingPackages ?? new ITaskItem[] { })
-            {
-                var fullPath = GetAbsolutePathFromProjectRelativePath(projectReference.ItemSpec);
-                if (_projectReferencesToOutputBasePaths.ContainsKey(fullPath))
-                {
-                    Log.LogWarningFromResources(nameof(Strings.DuplicateProjectReference), fullPath, nameof(ProjectReferencesCreatingPackages));
-                }
-                else
-                {
-                    var outputPath = projectReference.GetMetadata("OutputBasePath");
-                    _projectReferencesToOutputBasePaths.Add(fullPath, outputPath);
                 }
             }
         }
@@ -399,7 +369,7 @@ namespace Microsoft.NuGet.Build.Tasks
                         if (Path.GetExtension(file).Equals(".dll", StringComparison.OrdinalIgnoreCase))
                         {
                             string path;
-                            if (TryGetFile(package.Id, package.Version, file, out path))
+                            if (TryGetFile(package.Id, package.Version, package.RelativePackagePath, file, out path))
                             {
                                 var analyzer = new TaskItem(path);
 
@@ -471,16 +441,16 @@ namespace Microsoft.NuGet.Build.Tasks
             }
         }
 
-        private bool TryGetFile(string packageName, string packageVersion, string file, out string path)
+        private bool TryGetFile(string packageName, string packageVersion, string packageRelativePath, string file, out string path)
         {
             if (IsFileValid(file, "C#", "VB"))
             {
-                path = GetPath(packageName, packageVersion, file);
+                path = GetPath(packageName, packageVersion, packageRelativePath, file);
                 return true;
             }
             else if (IsFileValid(file, "VB", "C#"))
             {
-                path = GetPath(packageName, packageVersion, file);
+                path = GetPath(packageName, packageVersion, packageRelativePath, file);
                 return true;
             }
 
@@ -499,9 +469,9 @@ namespace Microsoft.NuGet.Build.Tasks
                             !file.Split('/').Any(x => x.Equals(unExpectedLanguage, StringComparison.OrdinalIgnoreCase)));
         }
 
-        private string GetPath(string packageName, string packageVersion, string file)
+        private string GetPath(string packageName, string packageVersion, string packageRelativePath, string file)
         {
-            return Path.Combine(GetNuGetPackagePath(packageName, packageVersion), file.Replace('/', Path.DirectorySeparatorChar));
+            return Path.Combine(GetNuGetPackagePath(packageName, packageVersion, packageRelativePath), file.Replace('/', Path.DirectorySeparatorChar));
         }
 
         /// <summary>
@@ -820,7 +790,7 @@ namespace Microsoft.NuGet.Build.Tasks
 
                 item.SetMetadata("Private", "false");
                 item.SetMetadata(NuGetIsFrameworkReference, "false");
-                item.SetMetadata(NuGetSourceType, package.IsProject ? NuGetSourceType_Project : NuGetSourceType_Package);
+                item.SetMetadata(NuGetSourceType, NuGetSourceType_Package);
 
                 items.Add(item);
 
@@ -881,31 +851,104 @@ namespace Microsoft.NuGet.Build.Tasks
 
         private void GetReferencedPackages(JObject lockFile)
         {
-            var projectFileDependencyGroups = (JObject)lockFile["projectFileDependencyGroups"];
-            var projectFileDependencies = (JArray)projectFileDependencyGroups[""];
+            var targets = (JObject)lockFile["targets"];
 
-            foreach (var packageDependency in projectFileDependencies.Select(v => (string)v))
+            string targetMoniker = null;
+            foreach (var preferredTargetMoniker in TargetMonikers)
             {
-                int firstSpace = packageDependency.IndexOf(' ');
+                var preferredTargetMonikerWithOptionalRuntimeIdentifier = GetTargetMonikerWithOptionalRuntimeIdentifier(preferredTargetMoniker, needsRuntimeIdentifier: false);
+                var target = (JObject)targets[preferredTargetMonikerWithOptionalRuntimeIdentifier];
 
-                if (firstSpace > -1)
+                if (target != null)
                 {
-                    _referencedPackages.Add(new TaskItem(packageDependency.Substring(0, firstSpace)));
+                    targetMoniker = preferredTargetMonikerWithOptionalRuntimeIdentifier;
+                    break;
+                }
+            }
+
+            var projectFileDependencyGroups = (JObject)lockFile["projectFileDependencyGroups"];
+            var allPackageNames = GetAllPackageNames(lockFile);
+
+            if (targetMoniker != null)
+            {
+                var targetSpecificDependencies = (JArray)projectFileDependencyGroups[targetMoniker];
+                if (targetSpecificDependencies != null)
+                {
+                    AddReferencedPackages(targetSpecificDependencies, allPackageNames);
+                }
+            }
+
+            var universalDependencies = (JArray)projectFileDependencyGroups[""];
+            if (universalDependencies != null)
+            {
+                AddReferencedPackages(universalDependencies, allPackageNames);
+            }
+        }
+
+        /// <summary>
+        /// Returns the set of all the package names (not including version numbers)
+        /// in the "libraries" section of the assets/lock file. Note that this includes
+        /// only proper packages; projects are specifically excluded.
+        /// </summary>
+        private static SortedSet<string> GetAllPackageNames(JObject lockFile)
+        {
+            var allPackageNames = new SortedSet<string>();
+            var libraries = (JObject)lockFile["libraries"];
+            foreach (var library in libraries)
+            {
+                var libraryObject = (JObject)library.Value;
+                string type = (string)libraryObject["type"];
+                if (type != null &&
+                    type.Equals("project", StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+
+                string name, version;
+                SplitPackageName(library.Key, out name, out version);
+                allPackageNames.Add(name);
+            }
+
+            return allPackageNames;
+        }
+
+        /// <summary>
+        /// Given a set of dependencies, identities the packages and adds their names to <see cref="_referencedPackages"/>.
+        /// </summary>
+        private void AddReferencedPackages(JArray packageDependencies, SortedSet<string> allPackageNames)
+        {
+            foreach (var packageDependency in packageDependencies.Select(v => (string)v))
+            {
+                // Strip the version, if any, from the dependency.
+                int firstSpace = packageDependency.IndexOf(' ');
+                string packageName = firstSpace > -1
+                    ? packageDependency.Substring(0, firstSpace)
+                    : packageDependency;
+
+                if (allPackageNames.Contains(packageName))
+                {
+                    _referencedPackages.Add(new TaskItem(packageName));
                 }
             }
         }
 
-        private string GetNuGetPackagePath(string packageId, string packageVersion)
+        private string GetNuGetPackagePath(string packageId, string packageVersion, string packageRelativePath)
         {
+            string relativePathToUse = String.IsNullOrEmpty(packageRelativePath)
+                                            ? Path.Combine(packageId, packageVersion)
+                                            : packageRelativePath.Replace('/', Path.DirectorySeparatorChar);
+
+            string hashFileName = $"{packageId.ToLowerInvariant()}.{packageVersion.ToLowerInvariant()}.nupkg.sha512";
+
             foreach (var packagesFolder in _packageFolders)
             {
-                string packagePath = Path.Combine(packagesFolder, packageId, packageVersion);
+                string packageFullPath = Path.Combine(packagesFolder, relativePathToUse);
 
                 // The proper way to check if a package is available is to look for the hash file, since that's the last
                 // file written as a part of the restore process. If it's not there, it means something failed part way through.
-                if (_fileExists(Path.Combine(packagePath, $"{packageId}.{packageVersion}.nupkg.sha512")))
+                if (_fileExists(Path.Combine(packageFullPath, hashFileName)))
                 {
-                    return packagePath;
+                    return packageFullPath;
                 }
             }
 
@@ -916,10 +959,8 @@ namespace Microsoft.NuGet.Build.Tasks
         {
             foreach (var package in target)
             {
-                var nameParts = package.Key.Split('/');
-                var id = nameParts[0];
-                var version = nameParts[1];
-                bool isProject = false;
+                string id, version;
+                SplitPackageName(package.Key, out id, out version);
 
                 var libraryObject = (JObject)lockFile["libraries"][package.Key];
 
@@ -931,36 +972,24 @@ namespace Microsoft.NuGet.Build.Tasks
                 }
 
                 // If this is a project then we need to figure out it's relative output path
-                if ((string)libraryObject["type"] == "project")
+                if ("project".Equals((string)libraryObject["type"], StringComparison.OrdinalIgnoreCase))
                 {
-                    isProject = true;
-
-                    fullPackagePathGenerator = () =>
-                    {
-                        var relativeMSBuildProjectPath = (string)libraryObject["msbuildProject"];
-
-                        if (string.IsNullOrEmpty(relativeMSBuildProjectPath))
-                        {
-                            throw new ExceptionFromResource(nameof(Strings.MissingMSBuildPathInProjectPackage), id);
-                        }
-
-                        var absoluteMSBuildProjectPath = GetAbsolutePathFromProjectRelativePath(relativeMSBuildProjectPath);
-                        string fullPackagePath;
-                        if (!_projectReferencesToOutputBasePaths.TryGetValue(absoluteMSBuildProjectPath, out fullPackagePath))
-                        {
-                            throw new ExceptionFromResource(nameof(Strings.MissingProjectReference), absoluteMSBuildProjectPath, nameof(ProjectReferencesCreatingPackages));
-                        }
-
-                        return fullPackagePath;
-                    };
+                    continue;
                 }
                 else
                 {
-                    fullPackagePathGenerator = () => GetNuGetPackagePath(id, version);
+                    fullPackagePathGenerator = () => GetNuGetPackagePath(id, version, (string)libraryObject["path"]);
                 }
 
-                yield return new NuGetPackageObject(id, version, isProject, fullPackagePathGenerator, (JObject)package.Value, libraryObject);
+                yield return new NuGetPackageObject(id, version, fullPackagePathGenerator, (JObject)package.Value, libraryObject);
             }
+        }
+
+        private static void SplitPackageName(string key, out string id, out string version)
+        {
+            var nameParts = key.Split('/');
+            id = nameParts[0];
+            version = nameParts[1];
         }
 
         private string GetAbsolutePathFromProjectRelativePath(string path)
